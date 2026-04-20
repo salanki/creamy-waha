@@ -346,29 +346,31 @@ func SetLocationAwayState(locationID string, away bool, token string) error {
 	return err
 }
 
-// SetDeviceTemperature sets the heat and/or cool target on a device.
-// When a schedule is active, the API expects "HeatHold"/"CoolHold" keys;
-// otherwise it expects "Heat"/"Cool".
-func SetDeviceTemperature(deviceID string, scheduleActive bool, heat, cool *float64, token string) error {
-	settings := map[string]any{}
-
-	if heat != nil {
-		if scheduleActive {
-			settings["HeatHold"] = *heat
-		} else {
-			settings["Heat"] = *heat
-		}
-	}
-	if cool != nil {
-		if scheduleActive {
-			settings["CoolHold"] = *cool
-		} else {
-			settings["Cool"] = *cool
-		}
+// SetDeviceTemperature sets both the heat and cool targets on a device.
+//
+// Both targets are always sent together, even when the caller only cares
+// about one. Live testing against the Tekmar 5xx API showed that sending
+// a single-field PATCH (e.g. {"Heat": 66}) in a single-direction mode
+// (Heat or Cool) is accepted but silently corrupts the omitted setpoint —
+// the server resets it to Schedule.HeatMin (Cool-only) or Schedule.CoolMax
+// (Heat-only). Callers must pass the current value of the field they aren't
+// changing; read it from a cached device state (see deviceState.Get).
+//
+// When a schedule is active, the API expects "HeatHold"/"CoolHold" keys
+// instead of "Heat"/"Cool". This branching is unverified against the 5xx
+// API (our capture ran with SchedEnable.Val="Off"); keep the existing
+// behavior until proven wrong.
+func SetDeviceTemperature(deviceID string, scheduleActive bool, heat, cool float64, token string) error {
+	heatKey, coolKey := "Heat", "Cool"
+	if scheduleActive {
+		heatKey, coolKey = "HeatHold", "CoolHold"
 	}
 
 	d, err := json.Marshal(map[string]any{
-		"Settings": settings,
+		"Settings": map[string]any{
+			heatKey: heat,
+			coolKey: cool,
+		},
 	})
 	if err != nil {
 		return err
@@ -940,7 +942,8 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		return tokens.AccessToken
 	}
 
-	// Single setpoint (used in heat-only or cool-only modes)
+	// Single setpoint (used in heat-only or cool-only modes). The API requires
+	// BOTH Heat and Cool in every PATCH; we echo the current non-changing value.
 	client.Subscribe(prefix+"/temp/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
@@ -955,46 +958,56 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		schedActive := state.IsScheduleActive(deviceID)
 		haMode := wattsToHAMode(dev.Data.Mode.Val)
 
-		var heat, cool *float64
+		heat, cool := dev.Data.Target.Heat, dev.Data.Target.Cool
 		switch haMode {
 		case "cool":
-			cool = &val
+			cool = val
 		default:
-			heat = &val
+			heat = val
 		}
 
-		log.Printf("setting temp on %s: heat=%v cool=%v (schedule=%v)", deviceID, heat, cool, schedActive)
+		log.Printf("setting temp on %s: heat=%.1f cool=%.1f (schedule=%v)", deviceID, heat, cool, schedActive)
 		if err := SetDeviceTemperature(deviceID, schedActive, heat, cool, getToken()); err != nil {
 			log.Printf("failed to set temp on %s: %v", deviceID, err)
 		}
 		pubSync <- true
 	})
 
-	// Dual setpoint: high (cool target)
+	// Dual setpoint: high (cool target). Echo current Heat so it isn't reset.
 	client.Subscribe(prefix+"/temp_high/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
 			log.Printf("invalid temp_high value: %s", msg.Payload())
 			return
 		}
+		dev, ok := state.Get(deviceID)
+		if !ok {
+			log.Printf("no known state for device %s", deviceID)
+			return
+		}
 		schedActive := state.IsScheduleActive(deviceID)
 		log.Printf("setting cool target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
-		if err := SetDeviceTemperature(deviceID, schedActive, nil, &val, getToken()); err != nil {
+		if err := SetDeviceTemperature(deviceID, schedActive, dev.Data.Target.Heat, val, getToken()); err != nil {
 			log.Printf("failed to set cool target on %s: %v", deviceID, err)
 		}
 		pubSync <- true
 	})
 
-	// Dual setpoint: low (heat target)
+	// Dual setpoint: low (heat target). Echo current Cool so it isn't reset.
 	client.Subscribe(prefix+"/temp_low/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
 			log.Printf("invalid temp_low value: %s", msg.Payload())
 			return
 		}
+		dev, ok := state.Get(deviceID)
+		if !ok {
+			log.Printf("no known state for device %s", deviceID)
+			return
+		}
 		schedActive := state.IsScheduleActive(deviceID)
 		log.Printf("setting heat target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
-		if err := SetDeviceTemperature(deviceID, schedActive, &val, nil, getToken()); err != nil {
+		if err := SetDeviceTemperature(deviceID, schedActive, val, dev.Data.Target.Cool, getToken()); err != nil {
 			log.Printf("failed to set heat target on %s: %v", deviceID, err)
 		}
 		pubSync <- true
