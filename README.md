@@ -24,30 +24,43 @@ This is not intended for production use. This application is unlikely to functio
 The project may not be hosted at this URL forever. 
 If you use it in your home, please fork the repository or keep a local copy so you can rebuild it or modify it in the future as needed.
 
-The supported features:
+Supported devices:
 
-- Login
-- Token refresh
-- Devices:
-  - Tekmar 564:
-    - Show current temperature and humidity
-    - Show current mode: heat, cool, heat/cool, emergency heat, off
-    - Show current action: heating, cooling, idle, off
-    - Show fan state: auto, on, schedule
-    - Accept MQTT commands to change temperature setpoint
-    - Accept MQTT commands to change current mode
-    - Accept MQTT commands to change fan state
+- **Tekmar 564** — the model this project was originally built against.
+- **Tekmar 563** — confirmed working (heat-pump capable, 4H/2C, optional radiant floor + humidifier accessory).
+- Other Tekmar 5xx thermostats and SunTouch controllers are expected to share the payload schema; the `MyDevice` struct uses `extra="allow"`-style tolerance so new fields don't break parsing.
+
+Per-device entities published via MQTT Discovery (gated on capabilities the specific thermostat advertises):
+
+| Entity                             | Scope                    | Gate                           |
+|------------------------------------|--------------------------|--------------------------------|
+| `climate.<room>`                   | HVAC target + action     | always                         |
+| `climate.<room>_floor`             | radiant floor minimum    | `Sensors.Floor.Status == "Okay"` |
+| `humidifier.<room>_humidifier`     | target humidity          | `Hum.Active == 1`              |
+| `sensor.<room>_outdoor_temperature`| outdoor temp             | `Sensors.Outdoor.Status == "Okay"` |
+| `sensor.<room>_floor_temperature`  | floor temp               | `Sensors.Floor.Status == "Okay"` |
+| `sensor.<room>_floor_max`          | floor max (diagnostic)   | `Sensors.Floor.Status == "Okay"` |
+| `sensor.<room>_heat_today`         | kWh heat today           | always                         |
+| `sensor.<room>_cool_today`         | kWh cool today           | always                         |
+| `binary_sensor.<room>_fan_running` | `Fan.Relay` (runtime)    | `Fan.Active == 1`              |
+| `binary_sensor.<room>_humidifier_running` | derived: Fan.Relay && Op==Off | `Hum.Active == 1`      |
+| `binary_sensor.<room>_radiant_heating` | derived: floor_temp < floor_min | floor sensor present |
+| `binary_sensor.<room>_cold_weather_shutdown` | `State.Sub == "CWSD"` (diagnostic) | always |
+| `switch.<location>_away`           | location-level away mode | `Location.SupportsAway`        |
+
+See [`docs/WATTS_API.md`](./docs/WATTS_API.md) for the full cloud API specification, including observed limitations (e.g., no dedicated humidifier-running flag, no floor-only heat call signal — only the heuristics above).
 
 Configuration:
 
-| Env Var          | Description                                          | Default                                |
-|------------------|------------------------------------------------------|----------------------------------------|
-| WAHA_USER        | Username to login with                               | No default. This variable is required. |
-| WAHA_PASS        | Password to login with                               | No default. This variable is required. |
-| WAHA_TOKENS_PATH | Writeable file path to save access/refresh tokens to | `tokens.json`                          |
-| WAHA_MQTT_BROKER | URI of MQTT broker                                   | `tcp://localhost:1883`                 |
-| WAHA_MQTT_USER   | Username for MQTT broker if required                 | Empty                                  |
-| WAHA_MQTT_PASS   | Password for MQTT broker if required                 | Empty                                  |
+| Env Var              | Description                                                         | Default                                |
+|----------------------|---------------------------------------------------------------------|----------------------------------------|
+| `WAHA_USER`          | Username to login with                                              | No default. This variable is required. |
+| `WAHA_PASS`          | Password to login with                                              | No default. This variable is required. |
+| `WAHA_TOKENS_PATH`   | Writeable file path to save access/refresh tokens to                | `tokens.json`                          |
+| `WAHA_MQTT_BROKER`   | URI of MQTT broker                                                  | `tcp://localhost:1883`                 |
+| `WAHA_MQTT_USER`     | Username for MQTT broker if required                                | Empty                                  |
+| `WAHA_MQTT_PASS`     | Password for MQTT broker if required                                | Empty                                  |
+| `WAHA_POLL_INTERVAL` | Cadence for polling `/Location/{id}/Devices`. Matches the mobile app's natural ~40 s cadence by default. Floored at 30 s. Go duration format (`40s`, `1m`). | `40s` |
 
 Running with Docker Compose:
 
