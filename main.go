@@ -346,29 +346,31 @@ func SetLocationAwayState(locationID string, away bool, token string) error {
 	return err
 }
 
-// SetDeviceTemperature sets the heat and/or cool target on a device.
-// When a schedule is active, the API expects "HeatHold"/"CoolHold" keys;
-// otherwise it expects "Heat"/"Cool".
-func SetDeviceTemperature(deviceID string, scheduleActive bool, heat, cool *float64, token string) error {
-	settings := map[string]any{}
-
-	if heat != nil {
-		if scheduleActive {
-			settings["HeatHold"] = *heat
-		} else {
-			settings["Heat"] = *heat
-		}
-	}
-	if cool != nil {
-		if scheduleActive {
-			settings["CoolHold"] = *cool
-		} else {
-			settings["Cool"] = *cool
-		}
+// SetDeviceTemperature sets both the heat and cool targets on a device.
+//
+// Both targets are always sent together, even when the caller only cares
+// about one. Live testing against the Tekmar 5xx API showed that sending
+// a single-field PATCH (e.g. {"Heat": 66}) in a single-direction mode
+// (Heat or Cool) is accepted but silently corrupts the omitted setpoint —
+// the server resets it to Schedule.HeatMin (Cool-only) or Schedule.CoolMax
+// (Heat-only). Callers must pass the current value of the field they aren't
+// changing; read it from a cached device state (see deviceState.Get).
+//
+// When a schedule is active, the API expects "HeatHold"/"CoolHold" keys
+// instead of "Heat"/"Cool". This branching is unverified against the 5xx
+// API (our capture ran with SchedEnable.Val="Off"); keep the existing
+// behavior until proven wrong.
+func SetDeviceTemperature(deviceID string, scheduleActive bool, heat, cool float64, token string) error {
+	heatKey, coolKey := "Heat", "Cool"
+	if scheduleActive {
+		heatKey, coolKey = "HeatHold", "CoolHold"
 	}
 
 	d, err := json.Marshal(map[string]any{
-		"Settings": settings,
+		"Settings": map[string]any{
+			heatKey: heat,
+			coolKey: cool,
+		},
 	})
 	if err != nil {
 		return err
@@ -402,6 +404,48 @@ func SetDeviceFanMode(deviceID, fanMode, token string) error {
 		return err
 	}
 
+	_, err = API[any]("PATCH", fmt.Sprintf("/Device/%v", url.PathEscape(deviceID)), bytes.NewReader(d), http.StatusOK, false, token)
+	return err
+}
+
+// SetDeviceFloorMin writes both the occupied (W) and away (A) radiant floor
+// minimums. Like SetDeviceTemperature, both fields are always sent — echo
+// the current value of the field you aren't changing.
+//
+// Payload: {"Settings":{"Schedule":{"Floor":{"W":<w>,"A":<a>}}}}
+//
+// FloorMax is read-only in this API; no writable companion exists.
+func SetDeviceFloorMin(deviceID string, w, a float64, token string) error {
+	d, err := json.Marshal(map[string]any{
+		"Settings": map[string]any{
+			"Schedule": map[string]any{
+				"Floor": map[string]any{
+					"W": w,
+					"A": a,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = API[any]("PATCH", fmt.Sprintf("/Device/%v", url.PathEscape(deviceID)), bytes.NewReader(d), http.StatusOK, false, token)
+	return err
+}
+
+// SetDeviceHumidity writes the humidifier target. Only meaningful when the
+// device has Hum.Active == 1.
+//
+// Payload: {"Settings":{"Hum":<val>}}
+func SetDeviceHumidity(deviceID string, target float64, token string) error {
+	d, err := json.Marshal(map[string]any{
+		"Settings": map[string]any{
+			"Hum": target,
+		},
+	})
+	if err != nil {
+		return err
+	}
 	_, err = API[any]("PATCH", fmt.Sprintf("/Device/%v", url.PathEscape(deviceID)), bytes.NewReader(d), http.StatusOK, false, token)
 	return err
 }
@@ -499,8 +543,17 @@ type MyDevice struct {
 			CoolMin     float64       `json:"CoolMin"`
 			Event       string        `json:"Event"`
 			FloorActive int           `json:"FloorActive"`
-			FloorMax    float64       `json:"FloorMax"`
-			FloorMin    float64       `json:"FloorMin"`
+			FloorMax    float64       `json:"FloorMax"` // read-only hardware limit
+			FloorMin    float64       `json:"FloorMin"` // read-only hardware limit
+			// Floor holds the user-facing radiant floor minimum setpoints. W is the
+			// occupied minimum; A is the away/setback minimum. These are writable
+			// via PATCH /Device/{id} with body:
+			//   {"Settings":{"Schedule":{"Floor":{"W":<occupied>,"A":<away>}}}}
+			// Distinct from FloorMin/FloorMax which are read-only hardware bounds.
+			Floor struct {
+				W float64 `json:"W"`
+				A float64 `json:"A"`
+			} `json:"Floor"`
 			Grp         int           `json:"Grp"`
 			Grp1        ScheduleGroup `json:"Grp1"`
 			Grp2        ScheduleGroup `json:"Grp2"`
@@ -682,6 +735,12 @@ func wattsToHAMode(wattsMode string) string {
 		return "fan_only"
 	case "dry", "dehumidify":
 		return "dry"
+	case "emer", "emergency":
+		// Heat-pump emergency/aux heat. HA has no canonical HVAC mode
+		// for this, but accepts arbitrary mode strings in the
+		// hvac_modes list and renders the snake_case as title-case
+		// ("Emergency heat") in the climate card.
+		return "emergency_heat"
 	default:
 		return strings.ToLower(wattsMode)
 	}
@@ -702,6 +761,8 @@ func haToWattsMode(haMode string) string {
 		return "Fan"
 	case "dry":
 		return "Dry"
+	case "emergency_heat":
+		return "Emer"
 	default:
 		return haMode
 	}
@@ -727,23 +788,30 @@ func mqttTopicPrefix(deviceID string) string {
 	return fmt.Sprintf("watts/%s", deviceID)
 }
 
+// publishDiscovery publishes MQTT Discovery configs for all entities
+// attached to a thermostat. Requires the device to be online with a valid
+// data block — an offline device has empty TempUnits.Val and zero bounds,
+// which HA's MQTT discovery validator rejects. Callers should gate on
+// device.IsConnected && device.Data.TempUnits.Val != "".
 func publishDiscovery(client mqtt.Client, device MyDevice) {
 	prefix := mqttTopicPrefix(device.DeviceID)
 
-	// Map available modes from the device
+	// Map available modes from the device. Dedupe — Watts' "Heat" and
+	// "Emer" are distinct modes (one is heat-pump, one is aux/emergency
+	// heat) and both should show up in HA, but if any mapping collision
+	// ever happened we don't want duplicate entries in hvac_modes.
 	var haModes []string
+	seen := map[string]bool{}
 	for _, m := range device.Data.Mode.Enum {
-		haModes = append(haModes, wattsToHAMode(m))
+		ha := wattsToHAMode(m)
+		if seen[ha] {
+			continue
+		}
+		seen[ha] = true
+		haModes = append(haModes, ha)
 	}
 	// Ensure "off" is always present
-	hasOff := false
-	for _, m := range haModes {
-		if m == "off" {
-			hasOff = true
-			break
-		}
-	}
-	if !hasOff {
+	if !seen["off"] {
 		haModes = append(haModes, "off")
 	}
 
@@ -757,7 +825,10 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 	}
 
 	config := map[string]any{
-		"name":                      device.Name,
+		// name: null so HA uses the device name as the entity name
+		// instead of concatenating device.name + entity.name (which would
+		// produce "Lower SouthWest Lower SouthWest").
+		"name":                      nil,
 		"unique_id":                 fmt.Sprintf("watts_%s", device.DeviceID),
 		"mode_command_topic":        prefix + "/mode/set",
 		"mode_state_topic":          prefix + "/mode/state",
@@ -812,29 +883,236 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 
 	// Outdoor temperature sensor
 	if device.Data.Sensors.Outdoor.Status == SensorStatusOkay {
-		sensorConfig := map[string]any{
-			"name":                "Outdoor Temperature",
-			"unique_id":           fmt.Sprintf("watts_%s_outdoor_temp", device.DeviceID),
-			"state_topic":         prefix + "/outdoor_temp",
+		publishTemperatureSensorDiscovery(client, device, "outdoor_temp", "Outdoor Temperature")
+	}
+
+	// Floor temperature sensor (only on radiant-floor rooms).
+	if device.Data.Sensors.Floor.Status == SensorStatusOkay {
+		publishTemperatureSensorDiscovery(client, device, "floor_temp", "Floor Temperature")
+
+		// Radiant-only heating detection. On a device with a floor sensor
+		// installed, State.Op=="Heat" AND Fan.Relay==0 means the radiant
+		// loop is calling without the air handler (forced-air heat would
+		// engage Fan.Relay). Not a perfect signal for mixed radiant+air
+		// rooms — if both are running, the fan is on and the radiant call
+		// is hidden — but for radiant-only rooms it's exact.
+		publishBinarySensorDiscovery(client, device, "radiant_heating", "Radiant Heating", "heat", "")
+
+		// Floor heating climate entity. The Watts API exposes two
+		// conceptually different "floor" values:
+		//
+		//   Schedule.Floor.W      — user-writable occupied floor
+		//                           minimum. Setting this raises the
+		//                           floor if it drops below W. This
+		//                           maps to the climate's target
+		//                           temperature (the "setpoint").
+		//   Schedule.FloorMin     — read-only hardware floor lower
+		//                           bound (the thermostat's absolute
+		//                           minimum capability).
+		//   Schedule.FloorMax     — read-only hardware safety ceiling,
+		//                           typically installer-set for the
+		//                           flooring material (e.g., hardwood
+		//                           protection). Maps to max_temp on
+		//                           the climate entity's slider.
+		//
+		// Modeled as a single-mode "heat" climate. HA requires at least
+		// one HVAC mode; the Watts API has no separate floor on/off
+		// (setting the setpoint to 0 is how you disable it), so we
+		// accept the mode_command topic and no-op on it. min_temp is 0
+		// to allow that "disabled" sentinel through the slider.
+		floorCfg := map[string]any{
+			"name":                      "Floor",
+			"unique_id":                 fmt.Sprintf("watts_%s_floor", device.DeviceID),
+			"current_temperature_topic": prefix + "/floor_temp",
+			"temperature_state_topic":   prefix + "/floor_target",
+			"temperature_command_topic": prefix + "/floor_target/set",
+			"mode_state_topic":          prefix + "/floor_mode",
+			"mode_command_topic":        prefix + "/floor_mode/set",
+			"action_topic":              prefix + "/floor_action",
+			"availability_topic":        prefix + "/availability",
+			"modes":                     []string{"heat"},
+			"min_temp":                  0,
+			"max_temp":                  device.Data.Schedule.FloorMax,
+			"temp_step":                 1,
+			"temperature_unit":          device.Data.TempUnits.Val,
+			"optimistic":                false,
+			"device":                    haDeviceBlock(device),
+		}
+		publishDiscoveryConfig(client, "climate",
+			fmt.Sprintf("watts_%s_floor", device.DeviceID), floorCfg)
+
+		// Floor Max diagnostic sensor — same value visible as max_temp
+		// on the climate entity's slider, but also surfaced as a
+		// standalone sensor so it can be shown as a numeric readout in
+		// dashboards / graphed / used in templates.
+		floorMaxCfg := map[string]any{
+			"name":                "Floor Max",
+			"unique_id":           fmt.Sprintf("watts_%s_floor_max", device.DeviceID),
+			"state_topic":         prefix + "/floor_max",
 			"availability_topic":  prefix + "/availability",
 			"device_class":        "temperature",
 			"state_class":         "measurement",
 			"unit_of_measurement": "°" + device.Data.TempUnits.Val,
-			"device": map[string]any{
-				"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
-				"name":         device.Name,
-				"manufacturer": "Watts",
-				"model":        device.ModelNumber,
-			},
+			"entity_category":     "diagnostic",
+			"icon":                "mdi:thermometer-chevron-up",
+			"device":              haDeviceBlock(device),
 		}
-		sensorPayload, _ := json.Marshal(sensorConfig)
-		sensorTopic := fmt.Sprintf("homeassistant/sensor/watts_%s_outdoor_temp/config", device.DeviceID)
-		t := client.Publish(sensorTopic, 1, true, sensorPayload)
-		t.Wait()
-		if t.Error() != nil {
-			log.Printf("failed to publish outdoor temp discovery for %s: %v", device.DeviceID, t.Error())
-		}
+		publishDiscoveryConfig(client, "sensor",
+			fmt.Sprintf("watts_%s_floor_max", device.DeviceID), floorMaxCfg)
 	}
+
+	// Fan running binary sensor (Fan.Relay == 1 means the fan motor is
+	// physically engaged; this is the only runtime relay the API exposes
+	// and is the closest thing to a "humidifier running" signal for rooms
+	// with a humidifier that drives the air handler).
+	if device.Data.Fan.Active == 1 {
+		publishBinarySensorDiscovery(client, device, "fan_running", "Fan Running", "running", "")
+	}
+
+	// Humidifier entity (only on rooms with a humidifier accessory).
+	//
+	// The Watts API has no explicit humidifier on/off: the accessory runs
+	// whenever current RH is below target. HA's humidifier MQTT schema
+	// requires an on/off command_topic + state_topic; we publish state=ON
+	// unconditionally and silently ignore OFF commands. With
+	// optimistic=false, HA waits for the state_topic to confirm a change
+	// before moving the toggle — since we never publish OFF, the toggle
+	// won't move and the user-visible effect is "the humidifier is always
+	// on, only the target changes things."
+	//
+	// Modes are intentionally omitted: HA's modes list is an inclusion
+	// group with mode_command_topic / mode_state_topic, and we have no
+	// real modes to expose.
+	if device.Data.Hum.Active == 1 {
+		humCfg := map[string]any{
+			"name":                          "Humidifier",
+			"unique_id":                     fmt.Sprintf("watts_%s_humidifier", device.DeviceID),
+			"device_class":                  "humidifier",
+			"command_topic":                 prefix + "/humidifier/set",
+			"state_topic":                   prefix + "/humidifier/state",
+			"target_humidity_command_topic": prefix + "/humidifier/target/set",
+			"target_humidity_state_topic":   prefix + "/humidifier/target",
+			"current_humidity_topic":        prefix + "/current_humidity",
+			"action_topic":                  prefix + "/humidifier/action",
+			"availability_topic":            prefix + "/availability",
+			"min_humidity":                  device.Data.Hum.Min,
+			"max_humidity":                  device.Data.Hum.Max,
+			"payload_on":                    "ON",
+			"payload_off":                   "OFF",
+			// optimistic: false so HA waits for state_topic confirmation
+			// before moving the on/off toggle. We never publish OFF, so
+			// the toggle can't be clicked off.
+			"optimistic": false,
+			"device":     haDeviceBlock(device),
+		}
+		publishDiscoveryConfig(client, "humidifier",
+			fmt.Sprintf("watts_%s_humidifier", device.DeviceID), humCfg)
+
+		// Runtime binary sensor for "the humidifier is engaged right now"
+		// — kept separate from the humidifier.action topic so it's
+		// addressable in automations as a first-class entity.
+		publishBinarySensorDiscovery(client, device, "humidifier_running",
+			"Humidifier Running", "running", "")
+	}
+
+	// Cold Weather Shutdown diagnostic — lights up when State.Sub=="CWSD"
+	// (heat-pump cooling locked out due to outdoor temp below the
+	// compressor's safe operating range). Helps explain why a room with a
+	// cool call isn't actually cooling.
+	publishBinarySensorDiscovery(client, device, "cold_weather_shutdown",
+		"Cold Weather Shutdown", "problem", "diagnostic")
+
+	// Daily energy sensors (today's heat/cool consumption in kWh).
+	// Energy.Heat.Daily / Energy.Cool.Daily each carry the last 7 days
+	// (oldest first); the last element is today's running total.
+	publishEnergySensorDiscovery(client, device, "energy_heat_today", "Heat Today")
+	publishEnergySensorDiscovery(client, device, "energy_cool_today", "Cool Today")
+}
+
+// publishEnergySensorDiscovery publishes an energy sensor (kWh, daily).
+// Uses state_class: total_increasing which tolerates the daily reset to 0.
+func publishEnergySensorDiscovery(client mqtt.Client, device MyDevice, key, name string) {
+	prefix := mqttTopicPrefix(device.DeviceID)
+	cfg := map[string]any{
+		"name":                name,
+		"unique_id":           fmt.Sprintf("watts_%s_%s", device.DeviceID, key),
+		"state_topic":         prefix + "/" + key,
+		"availability_topic":  prefix + "/availability",
+		"device_class":        "energy",
+		"state_class":         "total_increasing",
+		"unit_of_measurement": "kWh",
+		"device":              haDeviceBlock(device),
+	}
+	publishDiscoveryConfig(client, "sensor",
+		fmt.Sprintf("watts_%s_%s", device.DeviceID, key), cfg)
+}
+
+// publishTemperatureSensorDiscovery publishes MQTT Discovery for a
+// temperature sensor attached to a thermostat.
+func publishTemperatureSensorDiscovery(client mqtt.Client, device MyDevice, key, name string) {
+	prefix := mqttTopicPrefix(device.DeviceID)
+	cfg := map[string]any{
+		"name":                name,
+		"unique_id":           fmt.Sprintf("watts_%s_%s", device.DeviceID, key),
+		"state_topic":         prefix + "/" + key,
+		"availability_topic":  prefix + "/availability",
+		"device_class":        "temperature",
+		"state_class":         "measurement",
+		"unit_of_measurement": "°" + device.Data.TempUnits.Val,
+		"device":              haDeviceBlock(device),
+	}
+	publishDiscoveryConfig(client, "sensor",
+		fmt.Sprintf("watts_%s_%s", device.DeviceID, key), cfg)
+}
+
+// haDeviceBlock returns the standard device metadata block used by every
+// MQTT Discovery payload so entities on the same thermostat group together
+// in the HA UI.
+func haDeviceBlock(device MyDevice) map[string]any {
+	return map[string]any{
+		"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
+		"name":         device.Name,
+		"manufacturer": "Watts",
+		"model":        device.ModelNumber,
+	}
+}
+
+// publishDiscoveryConfig publishes a single MQTT Discovery config payload
+// to homeassistant/<component>/<object_id>/config.
+func publishDiscoveryConfig(client mqtt.Client, component, objectID string, config map[string]any) {
+	payload, _ := json.Marshal(config)
+	topic := fmt.Sprintf("homeassistant/%s/%s/config", component, objectID)
+	t := client.Publish(topic, 1, true, payload)
+	t.Wait()
+	if t.Error() != nil {
+		log.Printf("failed to publish discovery %s: %v", topic, t.Error())
+	}
+}
+
+// publishBinarySensorDiscovery publishes MQTT Discovery for a binary_sensor
+// entity attached to a thermostat. key is the object suffix (e.g.
+// "fan_running"); name is the human-readable label; deviceClass is HA's
+// binary_sensor device_class (empty string to omit); entityCategory is HA's
+// entity_category (e.g. "diagnostic") or empty to omit.
+func publishBinarySensorDiscovery(client mqtt.Client, device MyDevice, key, name, deviceClass, entityCategory string) {
+	prefix := mqttTopicPrefix(device.DeviceID)
+	cfg := map[string]any{
+		"name":               name,
+		"unique_id":          fmt.Sprintf("watts_%s_%s", device.DeviceID, key),
+		"state_topic":        prefix + "/" + key,
+		"availability_topic": prefix + "/availability",
+		"payload_on":         "ON",
+		"payload_off":        "OFF",
+		"device":             haDeviceBlock(device),
+	}
+	if deviceClass != "" {
+		cfg["device_class"] = deviceClass
+	}
+	if entityCategory != "" {
+		cfg["entity_category"] = entityCategory
+	}
+	publishDiscoveryConfig(client, "binary_sensor",
+		fmt.Sprintf("watts_%s_%s", device.DeviceID, key), cfg)
 }
 
 func publishState(client mqtt.Client, device MyDevice) {
@@ -866,20 +1144,21 @@ func publishState(client mqtt.Client, device MyDevice) {
 	haMode := wattsToHAMode(device.Data.Mode.Val)
 	pub("mode/state", haMode)
 
-	// Target temperatures
+	// Target temperatures. Always publish all three state topics from the
+	// latest Target.Heat/Target.Cool (the Watts API returns both even in
+	// single-direction modes), so HA never sees stale values carried over
+	// from a previous mode. The single `temp/state` tracks whichever
+	// setpoint is meaningful for the current mode; in heat_cool it stays
+	// equal to the heat target (HA's card consults target_temp_high/low
+	// in that mode anyway).
+	pub("temp_high/state", fmt.Sprintf("%.1f", device.Data.Target.Cool))
+	pub("temp_low/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
 	switch haMode {
-	case "heat_cool":
-		// Dual setpoint: publish both high (cool) and low (heat) targets
-		pub("temp_high/state", fmt.Sprintf("%.1f", device.Data.Target.Cool))
-		pub("temp_low/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
-		// Single target isn't meaningful in this mode, but publish heat as default
-		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
 	case "cool":
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Cool))
-	case "heat":
-		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
 	default:
-		// For off/fan_only/dry, publish whatever is there
+		// heat / heat_cool / emergency_heat / off — heat setpoint is
+		// the sensible single-target fallback
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
 	}
 
@@ -893,8 +1172,94 @@ func publishState(client mqtt.Client, device MyDevice) {
 		pub("fan/state", device.Data.Fan.Val)
 	}
 
+	// Fan running (physical relay state — the only runtime relay exposed
+	// by the API). Flips to ON during heat/cool calls that engage the air
+	// handler, and also during humidifier cycles (whole-home humidifiers
+	// drive the fan). In a room where heat is pure-radiant, this stays OFF
+	// even while State.Op == "Heat".
+	if device.Data.Fan.Active == 1 {
+		pub("fan_running", boolToOnOff(device.Data.Fan.Relay == 1))
+	}
+
+	// Floor heating entities on radiant-floor rooms.
+	if device.Data.Sensors.Floor.Status == SensorStatusOkay {
+		pub("floor_temp", fmt.Sprintf("%.1f", device.Data.Sensors.Floor.Value))
+
+		// Radiant-heating detector. The Watts API does NOT surface
+		// floor-only heat calls — State.Op reflects the thermostat's
+		// ROOM heat call (Target.Heat vs Room), not the floor's
+		// (Schedule.Floor.W vs Sensors.Floor.Val). Floor-only calls are
+		// handled locally by the Tekmar 563 and never reach the cloud.
+		//
+		// We infer instead: when the floor setpoint is enabled and the
+		// floor temperature is below it, the system should be calling
+		// for floor heat (modulo the thermostat's local hysteresis).
+		// This is an imperfect signal (may false-positive during the
+		// hysteresis deadband) but strictly more useful than always-idle.
+		floorTarget := device.Data.Schedule.Floor.W
+		floorTemp := device.Data.Sensors.Floor.Value
+		radiantCalling := floorTarget > 0 && floorTemp < floorTarget
+		pub("radiant_heating", boolToOnOff(radiantCalling))
+
+		// Floor climate entity state topics.
+		pub("floor_target", fmt.Sprintf("%.0f", floorTarget))
+		pub("floor_mode", "heat")
+		floorAction := "idle"
+		if radiantCalling {
+			floorAction = "heating"
+		}
+		pub("floor_action", floorAction)
+
+		// Floor Max diagnostic sensor state.
+		pub("floor_max", fmt.Sprintf("%.0f", device.Data.Schedule.FloorMax))
+	}
+
+	// Cold Weather Shutdown diagnostic (always published, not gated).
+	pub("cold_weather_shutdown", boolToOnOff(device.Data.State.Sub == "CWSD"))
+
+	// Humidifier state (only on rooms with a humidifier accessory).
+	// Runtime heuristic: whole-home humidifiers drive the air-handler
+	// fan to distribute moisture. On a room where the humidifier is
+	// installed, Fan.Relay==1 AND State.Op=="Off" means the humidifier
+	// is the likely reason — no heat/cool call to explain the fan. Not
+	// perfect (the API provides no dedicated humidifier-running flag)
+	// but it's the best signal available.
+	if device.Data.Hum.Active == 1 {
+		// Fixed ON — the Watts humidifier has no user-facing disable,
+		// so the HA humidifier entity's on/off stays pinned to ON.
+		pub("humidifier/state", "ON")
+		pub("humidifier/target", fmt.Sprintf("%d", device.Data.Hum.Val))
+
+		humidifying := device.Data.Fan.Relay == 1 && device.Data.State.Op == "Off"
+		humAction := "idle"
+		if humidifying {
+			humAction = "humidifying"
+		}
+		pub("humidifier/action", humAction)
+		pub("humidifier_running", boolToOnOff(humidifying))
+	}
+
 	// Action (what the system is currently doing)
 	pub("action", wattsToHAAction(device.Data.State.Op))
+
+	// Daily energy — last element of the 7-day array is today's total.
+	if len(device.Data.Energy.Heat.Daily) > 0 {
+		pub("energy_heat_today", fmt.Sprintf("%.2f",
+			device.Data.Energy.Heat.Daily[len(device.Data.Energy.Heat.Daily)-1]))
+	}
+	if len(device.Data.Energy.Cool.Daily) > 0 {
+		pub("energy_cool_today", fmt.Sprintf("%.2f",
+			device.Data.Energy.Cool.Daily[len(device.Data.Energy.Cool.Daily)-1]))
+	}
+}
+
+// boolToOnOff converts a Go bool to the MQTT ON/OFF string convention
+// used by binary_sensor entities.
+func boolToOnOff(on bool) string {
+	if on {
+		return "ON"
+	}
+	return "OFF"
 }
 
 // deviceState tracks the latest known state of each device so command
@@ -927,7 +1292,7 @@ func (ds *deviceState) IsScheduleActive(deviceID string) bool {
 	return strings.ToLower(d.Data.SchedEnable.Val) == "on" || strings.ToLower(d.Data.SchedEnable.Val) == "enabled"
 }
 
-func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, tokens *ExchangedAuthTokenResponse, username, pass, tokensPath string, tokensMu *sync.Mutex, pubSync chan bool) {
+func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, tokens *ExchangedAuthTokenResponse, username, pass, tokensPath string, tokensMu *sync.Mutex, pubSync chan string) {
 	prefix := mqttTopicPrefix(device.DeviceID)
 	deviceID := device.DeviceID
 
@@ -940,7 +1305,8 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		return tokens.AccessToken
 	}
 
-	// Single setpoint (used in heat-only or cool-only modes)
+	// Single setpoint (used in heat-only or cool-only modes). The API requires
+	// BOTH Heat and Cool in every PATCH; we echo the current non-changing value.
 	client.Subscribe(prefix+"/temp/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
@@ -955,49 +1321,59 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		schedActive := state.IsScheduleActive(deviceID)
 		haMode := wattsToHAMode(dev.Data.Mode.Val)
 
-		var heat, cool *float64
+		heat, cool := dev.Data.Target.Heat, dev.Data.Target.Cool
 		switch haMode {
 		case "cool":
-			cool = &val
+			cool = val
 		default:
-			heat = &val
+			heat = val
 		}
 
-		log.Printf("setting temp on %s: heat=%v cool=%v (schedule=%v)", deviceID, heat, cool, schedActive)
+		log.Printf("setting temp on %s: heat=%.1f cool=%.1f (schedule=%v)", deviceID, heat, cool, schedActive)
 		if err := SetDeviceTemperature(deviceID, schedActive, heat, cool, getToken()); err != nil {
 			log.Printf("failed to set temp on %s: %v", deviceID, err)
 		}
-		pubSync <- true
+		pubSync <- deviceID
 	})
 
-	// Dual setpoint: high (cool target)
+	// Dual setpoint: high (cool target). Echo current Heat so it isn't reset.
 	client.Subscribe(prefix+"/temp_high/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
 			log.Printf("invalid temp_high value: %s", msg.Payload())
 			return
 		}
+		dev, ok := state.Get(deviceID)
+		if !ok {
+			log.Printf("no known state for device %s", deviceID)
+			return
+		}
 		schedActive := state.IsScheduleActive(deviceID)
 		log.Printf("setting cool target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
-		if err := SetDeviceTemperature(deviceID, schedActive, nil, &val, getToken()); err != nil {
+		if err := SetDeviceTemperature(deviceID, schedActive, dev.Data.Target.Heat, val, getToken()); err != nil {
 			log.Printf("failed to set cool target on %s: %v", deviceID, err)
 		}
-		pubSync <- true
+		pubSync <- deviceID
 	})
 
-	// Dual setpoint: low (heat target)
+	// Dual setpoint: low (heat target). Echo current Cool so it isn't reset.
 	client.Subscribe(prefix+"/temp_low/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
 		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
 		if err != nil {
 			log.Printf("invalid temp_low value: %s", msg.Payload())
 			return
 		}
+		dev, ok := state.Get(deviceID)
+		if !ok {
+			log.Printf("no known state for device %s", deviceID)
+			return
+		}
 		schedActive := state.IsScheduleActive(deviceID)
 		log.Printf("setting heat target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
-		if err := SetDeviceTemperature(deviceID, schedActive, &val, nil, getToken()); err != nil {
+		if err := SetDeviceTemperature(deviceID, schedActive, val, dev.Data.Target.Cool, getToken()); err != nil {
 			log.Printf("failed to set heat target on %s: %v", deviceID, err)
 		}
-		pubSync <- true
+		pubSync <- deviceID
 	})
 
 	// Mode
@@ -1008,7 +1384,7 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		if err := SetDeviceMode(deviceID, wattsMode, getToken()); err != nil {
 			log.Printf("failed to set mode on %s: %v", deviceID, err)
 		}
-		pubSync <- true
+		pubSync <- deviceID
 	})
 
 	// Fan mode
@@ -1018,8 +1394,142 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		if err := SetDeviceFanMode(deviceID, fanMode, getToken()); err != nil {
 			log.Printf("failed to set fan mode on %s: %v", deviceID, err)
 		}
-		pubSync <- true
+		pubSync <- deviceID
 	})
+
+	// Floor climate target (Schedule.Floor.W — the user-facing occupied
+	// floor minimum). Echoes current Away (A) so it isn't reset by the
+	// server's both-fields requirement.
+	client.Subscribe(prefix+"/floor_target/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
+		if err != nil {
+			log.Printf("invalid floor target value: %s", msg.Payload())
+			return
+		}
+		dev, ok := state.Get(deviceID)
+		if !ok {
+			log.Printf("no known state for device %s", deviceID)
+			return
+		}
+		log.Printf("setting floor target on %s: W=%.1f (A=%.1f unchanged)",
+			deviceID, val, dev.Data.Schedule.Floor.A)
+		if err := SetDeviceFloorMin(deviceID, val, dev.Data.Schedule.Floor.A, getToken()); err != nil {
+			log.Printf("failed to set floor target on %s: %v", deviceID, err)
+		}
+		pubSync <- deviceID
+	})
+
+	// Floor climate mode — only "heat" is supported; the Watts API has
+	// no separate floor on/off (target=0 is how you "disable" it). Accept
+	// the command to satisfy HA's climate schema but no-op.
+	client.Subscribe(prefix+"/floor_mode/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		log.Printf("floor_mode on %s: %q (no-op; drag target to 0 to disable)",
+			deviceID, string(msg.Payload()))
+	})
+
+	// Humidifier target humidity (from the humidifier entity's
+	// target_humidity_command_topic).
+	client.Subscribe(prefix+"/humidifier/target/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		val, err := strconv.ParseFloat(string(msg.Payload()), 64)
+		if err != nil {
+			log.Printf("invalid humidity target: %s", msg.Payload())
+			return
+		}
+		log.Printf("setting humidity target on %s: %.0f", deviceID, val)
+		if err := SetDeviceHumidity(deviceID, val, getToken()); err != nil {
+			log.Printf("failed to set humidity target on %s: %v", deviceID, err)
+		}
+		pubSync <- deviceID
+	})
+
+	// Humidifier on/off command. The Watts API has no explicit enable
+	// flag, so we silently accept and ignore both ON and OFF — the
+	// entity's state_topic stays pinned to ON and (with
+	// optimistic=false) HA's toggle won't move. Logged for debugging.
+	client.Subscribe(prefix+"/humidifier/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		cmd := string(msg.Payload())
+		log.Printf("humidifier %s on %s: no-op (Watts API has no explicit enable; entity pinned ON)",
+			cmd, deviceID)
+	})
+}
+
+// locationTopicPrefix is the MQTT topic root for location-scoped state
+// (away switch, etc.). Distinct from per-device prefixes.
+func locationTopicPrefix(locationID string) string {
+	return fmt.Sprintf("watts/location/%s", locationID)
+}
+
+// publishLocationDiscovery publishes the MQTT Discovery config for a
+// location-scoped switch.away.
+func publishLocationDiscovery(client mqtt.Client, loc Location) {
+	if !loc.SupportsAway {
+		return
+	}
+	prefix := locationTopicPrefix(loc.LocationID)
+	cfg := map[string]any{
+		"name":               "Away",
+		"unique_id":          fmt.Sprintf("watts_location_%s_away", loc.LocationID),
+		"command_topic":      prefix + "/away/set",
+		"state_topic":        prefix + "/away/state",
+		"availability_topic": prefix + "/availability",
+		"payload_on":         "ON",
+		"payload_off":        "OFF",
+		"device": map[string]any{
+			"identifiers":  []string{fmt.Sprintf("watts_location_%s", loc.LocationID)},
+			"name":         loc.Name,
+			"manufacturer": "Watts",
+			"model":        "Location",
+		},
+	}
+	publishDiscoveryConfig(client, "switch",
+		fmt.Sprintf("watts_location_%s_away", loc.LocationID), cfg)
+}
+
+// subscribeLocationCommands wires the away/set topic to the Watts API.
+// Call once per location at startup.
+func subscribeLocationCommands(client mqtt.Client, loc Location, tokens *ExchangedAuthTokenResponse, username, pass, tokensPath string, tokensMu *sync.Mutex, pubSync chan string) {
+	if !loc.SupportsAway {
+		return
+	}
+	prefix := locationTopicPrefix(loc.LocationID)
+	getToken := func() string {
+		tokensMu.Lock()
+		defer tokensMu.Unlock()
+		if tokens.ExpiresOn < int(time.Now().Add(2*time.Minute).Unix()) {
+			*tokens = authenticate(username, pass, tokensPath)
+		}
+		return tokens.AccessToken
+	}
+	client.Subscribe(prefix+"/away/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		cmd := string(msg.Payload())
+		away := cmd == "ON"
+		log.Printf("setting away state on location %s: %v", loc.LocationID, away)
+		if err := SetLocationAwayState(loc.LocationID, away, getToken()); err != nil {
+			log.Printf("failed to set away state on location %s: %v", loc.LocationID, err)
+		}
+		// Location-wide change, no specific device to /Refresh.
+		pubSync <- ""
+	})
+}
+
+// publishLocationState publishes the location-scoped state topics.
+// awayState mirrors the value from any device's location.awayState
+// (they're all the same within a location).
+func publishLocationState(client mqtt.Client, loc Location, awayState int, online bool) {
+	if !loc.SupportsAway {
+		return
+	}
+	prefix := locationTopicPrefix(loc.LocationID)
+	pub := func(topic, value string) {
+		t := client.Publish(prefix+"/"+topic, 0, true, value)
+		t.Wait()
+	}
+	if online {
+		pub("availability", "online")
+	} else {
+		pub("availability", "offline")
+	}
+	pub("away/state", boolToOnOff(awayState == 1))
 }
 
 func main() {
@@ -1033,7 +1543,24 @@ func main() {
 	mqttBroker := envOrDefault("WAHA_MQTT_BROKER", "tcp://localhost:1883")
 	mqttUser := os.Getenv("WAHA_MQTT_USER")
 	mqttPass := os.Getenv("WAHA_MQTT_PASS")
-	pollInterval := 5 * time.Minute
+
+	// Poll cadence. The official mobile app polls at a nominal ~40 s
+	// interval when foregrounded (measured median 39.9 s across 10 clean
+	// inter-poll gaps); match that as the default. Floor at 30 s — the
+	// app doesn't go faster and we don't want to draw unwanted attention
+	// from the backend. See docs/WATTS_API.md §9.
+	pollInterval := 40 * time.Second
+	if v := os.Getenv("WAHA_POLL_INTERVAL"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatalf("invalid WAHA_POLL_INTERVAL %q: %v", v, err)
+		}
+		if parsed < 30*time.Second {
+			log.Printf("WAHA_POLL_INTERVAL %v is below 30 s floor; using 30 s", parsed)
+			parsed = 30 * time.Second
+		}
+		pollInterval = parsed
+	}
 
 	// Authenticate with Watts API
 	tokens := authenticate(username, pass, tokensPath)
@@ -1099,13 +1626,30 @@ func main() {
 	}
 	deviceStates.Update(devices.Body)
 
-	pubSync := make(chan bool)
+	pubSync := make(chan string, 4)
+
+	// Track which devices we've already published discovery for. Offline
+	// devices at startup are skipped (their data block is empty and HA's
+	// validator rejects empty temperature_unit); we retry in doSync when
+	// they come online. Discovery is idempotent on MQTT (retained), but
+	// we avoid the extra work.
+	publishedDiscovery := map[string]bool{}
 
 	for _, device := range devices.Body {
 		subscribeCommands(mqttClient, device, deviceStates, &tokens, username, pass, tokensPath, &tokensMu, pubSync)
-		publishDiscovery(mqttClient, device)
+		if device.IsConnected && device.Data.TempUnits.Val != "" {
+			publishDiscovery(mqttClient, device)
+			publishedDiscovery[device.DeviceID] = true
+		} else {
+			log.Printf("deferring discovery for %s (%s): device offline", device.Name, device.DeviceID)
+		}
 		publishState(mqttClient, device)
 	}
+
+	// Location-scoped entities (away switch).
+	publishLocationDiscovery(mqttClient, defaultLocation)
+	subscribeLocationCommands(mqttClient, defaultLocation, &tokens, username, pass, tokensPath, &tokensMu, pubSync)
+	publishLocationState(mqttClient, defaultLocation, defaultLocation.AwayState, true)
 
 	log.Printf("publishing state for %d device(s) every %v", len(devices.Body), pollInterval)
 
@@ -1116,12 +1660,29 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	doSync := func() {
+	doSync := func(refreshDeviceID string) {
 		// Re-authenticate if token is about to expire
 		tokensMu.Lock()
 		if tokens.ExpiresOn < int(time.Now().Add(2*time.Minute).Unix()) {
 			log.Println("token expiring soon, re-authenticating")
 			tokens = authenticate(username, pass, tokensPath)
+		}
+
+		// If a device just received a write, ask the server to pull a fresh
+		// status from the thermostat before we re-fetch. Integration testing
+		// showed /Device/{id}/Refresh updates data.DateTime within ~3 s,
+		// compared to up to 40 s waiting for the next natural poll.
+		if refreshDeviceID != "" {
+			if _, err := API[any]("GET",
+				fmt.Sprintf("/Device/%v/Refresh", url.PathEscape(refreshDeviceID)),
+				nil, http.StatusOK, false, tokens.AccessToken); err != nil {
+				log.Printf("post-write /Refresh on %s: %v", refreshDeviceID, err)
+			}
+			// Small delay so the thermostat's push has a chance to land
+			// before we re-fetch.
+			tokensMu.Unlock()
+			time.Sleep(1 * time.Second)
+			tokensMu.Lock()
 		}
 
 		devices, err := GetDevices(defaultLocation.LocationID, tokens.AccessToken)
@@ -1133,18 +1694,39 @@ func main() {
 
 		deviceStates.Update(devices.Body)
 
+		// Location-scoped state — every connected device has the same
+		// location.awayState. Pick any connected one; if none is connected,
+		// preserve the last known state (MQTT retained) and mark offline.
+		locationOnline := false
+		locationAway := defaultLocation.AwayState
+		for _, d := range devices.Body {
+			if d.IsConnected {
+				locationOnline = true
+				locationAway = d.Location.AwayState
+				break
+			}
+		}
+		publishLocationState(mqttClient, defaultLocation, locationAway, locationOnline)
+
 		for _, device := range devices.Body {
+			// Publish discovery for any device we couldn't announce at
+			// startup (it was offline) now that it has valid data.
+			if !publishedDiscovery[device.DeviceID] && device.IsConnected && device.Data.TempUnits.Val != "" {
+				log.Printf("publishing discovery for %s (%s) after reconnect", device.Name, device.DeviceID)
+				publishDiscovery(mqttClient, device)
+				publishedDiscovery[device.DeviceID] = true
+			}
 			publishState(mqttClient, device)
 		}
 	}
 
 	for {
 		select {
-		case <-pubSync:
-			doSync()
+		case refreshID := <-pubSync:
+			doSync(refreshID)
 
 		case <-ticker.C:
-			doSync()
+			doSync("")
 
 		case sig := <-sigCh:
 			log.Printf("received %v, shutting down", sig)

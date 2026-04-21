@@ -1,0 +1,91 @@
+{
+  "deviceId": "00000000-0000-0000-0000-000000000001",
+  "name": "Test Room",
+  "modelId": 8,
+  "modelNumber": "563",
+  "deviceType": "Thermostat",
+  "deviceTypeId": 2,
+  "imageUrl": null,
+  "isConnected": true,
+  "isShared": false,
+  "requestingUser": "00000000-0000-0000-0000-000000000099",
+  "location": {
+    "address": {
+      "address": "",
+      "address2": "",
+      "city": "",
+      "state_province": "",
+      "zipcode": "",
+      "country": ""
+    },
+    "awayState": 0,
+    "locationId": "00000000-0000-0000-0000-0000000000aa",
+    "name": "Test Location",
+    "userType": 1
+  },
+  "data": {
+    "DateTime": "2026-04-20T03:43:46Z",
+    "TZOffset": -14400,
+    "Sensors": {
+      "Room":    { "Val": 68, "Status": "Okay" },
+      "Floor":   { "Val": 66, "Status": "Okay" },
+      "Outdoor": { "Val": 41, "Status": "Okay" },
+      "RH":      { "Val": 45, "Status": "Okay" }
+    },
+    "State": { "Op": "Off", "Sub": "None" },
+    "Mode": {
+      "Active": 1,
+      "Val":    "Auto",
+      "Enum":   ["Off", "Heat", "Cool", "Auto", "Emer"]
+    },
+    "Target": {
+      "Active": 1, "Sensor": "Room", "Hold": 0,
+      "Heat": 67, "Cool": 80,
+      "Min": 40, "Max": 100, "Steps": 1
+    },
+    "Hum":   { "Active": 1, "Val": 29, "Min": 10, "Max": 80, "Steps": 1 },
+    "Dehum": { "Active": 0, "Val": 60, "Min": 20, "Max": 90, "Steps": 1 },
+    "TempInterlock": 2.0,
+    "HumInterlock":  1,
+    "Fan": {
+      "Active": 1,
+      "Val":    "Auto",
+      "Enum":   ["Auto", "On"],
+      "Relay":  0
+    },
+    "TempUnits": { "Active": 1, "Val": "F", "Enum": ["F", "C"] },
+    "Units": "Imperial",
+    "SchedEnable": { "Active": 1, "Val": "Off", "Enum": ["Off", "On"] },
+    "Schedule": {
+      "SchedActive": 0,
+      "HeatActive":  1,
+      "CoolActive":  1,
+      "FloorActive": 1,
+      "Grp":    null,
+      "Event":  null,
+      "Grp1": {
+        "Days": "MTWRF",
+        "W": { "T": "06:00", "H": 70, "C": 78 },
+        "L": { "T": "08:00", "H": 65, "C": 85 },
+        "R": { "T": "17:00", "H": 70, "C": 78 },
+        "S": { "T": "22:00", "H": 65, "C": 85 }
+      },
+      "Grp2": {},
+      "Grp3": {},
+      "Grp4": {},
+      "Grp5": {},
+      "Grp6": {},
+      "Grp7": {},
+      "Floor":    { "W": 67, "A": 66 },
+      "HeatMin": 40, "HeatMax": 95,
+      "CoolMin": 45, "CoolMax": 100,
+      "FloorMin": 40, "FloorMax": 80,
+      "TempSteps": 1, "TimeSteps": 10
+    },
+    "Energy": {
+      "Heat": { "Daily": [0, 0, 0, 0, 0, 0, 1.2], "Monthly": [0.2, 0.9, 1.2, 0.0, 1.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6, 0.1] },
+      "Cool": { "Daily": [0, 0, 0, 0, 0, 0, 0],   "Monthly": [0.0, 0.0, 0.3, 0.0, 65.8, 31.3, 143.2, 173.6, 135.6, 95.8, 5.0, 0.0] }
+    },
+    "OpenADR": { "Active": 0, "Val": "Inactive", "Enum": ["Inactive", "Active"] }
+  }
+}
