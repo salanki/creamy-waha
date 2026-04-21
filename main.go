@@ -1265,9 +1265,26 @@ func boolToOnOff(on bool) string {
 // deviceState tracks the latest known state of each device so command
 // handlers can determine whether a schedule is active.
 type deviceState struct {
-	mu      sync.RWMutex
-	devices map[string]MyDevice // keyed by deviceID
+	mu       sync.RWMutex
+	devices  map[string]MyDevice      // keyed by deviceID
+	expected map[string]expectedWrite // keyed by deviceID — pending writes awaiting confirmation via poll
 }
+
+// expectedWrite holds per-field values the user wrote that we haven't
+// yet seen echoed in a poll response. The cloud's read API lags writes
+// by a variable amount (5 s – 60 s+ in practice); we keep publishing
+// the user's intent until a poll confirms it, then clear the entry.
+// Abandoned after expectedAbandonAfter to avoid pinning forever if the
+// cloud silently refuses a write.
+type expectedWrite struct {
+	heat, cool     *float64
+	floorW, floorA *float64
+	humVal         *int
+	mode, fan      *string
+	ts             time.Time
+}
+
+const expectedAbandonAfter = 5 * time.Minute
 
 func (ds *deviceState) Update(devices []MyDevice) {
 	ds.mu.Lock()
@@ -1282,6 +1299,124 @@ func (ds *deviceState) Get(deviceID string) (MyDevice, bool) {
 	defer ds.mu.RUnlock()
 	d, ok := ds.devices[deviceID]
 	return d, ok
+}
+
+// Mutate runs the given mutator on the cached MyDevice for deviceID.
+// Used by command handlers to keep the cache consistent so that echoed
+// values in subsequent writes (e.g., sending both Heat and Cool each
+// time) see fresh data rather than stale values from the previous poll.
+// Does NOT by itself affect the poll-confirmation logic — call Expect()
+// separately for that.
+func (ds *deviceState) Mutate(deviceID string, mutator func(*MyDevice)) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if d, ok := ds.devices[deviceID]; ok {
+		mutator(&d)
+		ds.devices[deviceID] = d
+	}
+}
+
+// Expect records what the user just wrote so the poll loop can override
+// stale polled values with the user's intent until the cloud catches up.
+// Each call merges into any existing pending expectation (later writes
+// supersede earlier ones field-by-field). The timestamp is refreshed so
+// each new write resets the abandonment timer.
+func (ds *deviceState) Expect(deviceID string, mutator func(*expectedWrite)) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	e := ds.expected[deviceID]
+	mutator(&e)
+	e.ts = time.Now()
+	ds.expected[deviceID] = e
+}
+
+// MergeExpected overlays pending-write values onto a freshly-polled
+// device and, for each field, clears the expectation if the poll confirms
+// our written value. The returned device reflects our intent for
+// unconfirmed fields and the poll for everything else. Entries older
+// than expectedAbandonAfter are dropped (the cloud silently rejected a
+// write, or an external change on the thermostat itself superseded us).
+// Runtime fields (State.Op, Fan.Relay, sensor readings, energy) always
+// come from the poll.
+func (ds *deviceState) MergeExpected(polled MyDevice) MyDevice {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	e, ok := ds.expected[polled.DeviceID]
+	if !ok {
+		return polled
+	}
+	if time.Since(e.ts) > expectedAbandonAfter {
+		delete(ds.expected, polled.DeviceID)
+		return polled
+	}
+	if e.heat != nil {
+		if polled.Data.Target.Heat == *e.heat {
+			e.heat = nil
+		} else {
+			polled.Data.Target.Heat = *e.heat
+		}
+	}
+	if e.cool != nil {
+		if polled.Data.Target.Cool == *e.cool {
+			e.cool = nil
+		} else {
+			polled.Data.Target.Cool = *e.cool
+		}
+	}
+	if e.floorW != nil {
+		if polled.Data.Schedule.Floor.W == *e.floorW {
+			e.floorW = nil
+		} else {
+			polled.Data.Schedule.Floor.W = *e.floorW
+		}
+	}
+	if e.floorA != nil {
+		if polled.Data.Schedule.Floor.A == *e.floorA {
+			e.floorA = nil
+		} else {
+			polled.Data.Schedule.Floor.A = *e.floorA
+		}
+	}
+	if e.humVal != nil {
+		if polled.Data.Hum.Val == *e.humVal {
+			e.humVal = nil
+		} else {
+			polled.Data.Hum.Val = *e.humVal
+		}
+	}
+	if e.mode != nil {
+		if strings.EqualFold(polled.Data.Mode.Val, *e.mode) {
+			e.mode = nil
+		} else {
+			polled.Data.Mode.Val = *e.mode
+		}
+	}
+	if e.fan != nil {
+		if polled.Data.Fan.Val == *e.fan {
+			e.fan = nil
+		} else {
+			polled.Data.Fan.Val = *e.fan
+		}
+	}
+	if e.heat == nil && e.cool == nil && e.floorW == nil && e.floorA == nil &&
+		e.humVal == nil && e.mode == nil && e.fan == nil {
+		delete(ds.expected, polled.DeviceID)
+	} else {
+		ds.expected[polled.DeviceID] = e
+	}
+	return polled
+}
+
+// publishDeviceFromCache publishes MQTT state for a single device using
+// the latest cached values. Called from command handlers immediately
+// after Mutate+Expect so HA sees the user's change in milliseconds — a
+// race-free alternative to waiting on the pubSync→doSync cycle, which
+// can lag by 5 s (post-write /Refresh sleep) plus any time the ticker
+// consumes first with a stale poll.
+func publishDeviceFromCache(client mqtt.Client, ds *deviceState, deviceID string) {
+	if d, ok := ds.Get(deviceID); ok {
+		publishState(client, d)
+	}
 }
 
 func (ds *deviceState) IsScheduleActive(deviceID string) bool {
@@ -1332,7 +1467,15 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting temp on %s: heat=%.1f cool=%.1f (schedule=%v)", deviceID, heat, cool, schedActive)
 		if err := SetDeviceTemperature(deviceID, schedActive, heat, cool, getToken()); err != nil {
 			log.Printf("failed to set temp on %s: %v", deviceID, err)
+			return
 		}
+		state.Mutate(deviceID, func(d *MyDevice) {
+			d.Data.Target.Heat = heat
+			d.Data.Target.Cool = cool
+		})
+		h, c := heat, cool
+		state.Expect(deviceID, func(e *expectedWrite) { e.heat, e.cool = &h, &c })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1352,7 +1495,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting cool target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
 		if err := SetDeviceTemperature(deviceID, schedActive, dev.Data.Target.Heat, val, getToken()); err != nil {
 			log.Printf("failed to set cool target on %s: %v", deviceID, err)
+			return
 		}
+		v := val
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Target.Cool = v })
+		state.Expect(deviceID, func(e *expectedWrite) { e.cool = &v })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1372,7 +1520,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting heat target on %s: %.1f (schedule=%v)", deviceID, val, schedActive)
 		if err := SetDeviceTemperature(deviceID, schedActive, val, dev.Data.Target.Cool, getToken()); err != nil {
 			log.Printf("failed to set heat target on %s: %v", deviceID, err)
+			return
 		}
+		v := val
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Target.Heat = v })
+		state.Expect(deviceID, func(e *expectedWrite) { e.heat = &v })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1383,7 +1536,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting mode on %s: %s (watts: %s)", deviceID, haMode, wattsMode)
 		if err := SetDeviceMode(deviceID, wattsMode, getToken()); err != nil {
 			log.Printf("failed to set mode on %s: %v", deviceID, err)
+			return
 		}
+		m := wattsMode
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Mode.Val = m })
+		state.Expect(deviceID, func(e *expectedWrite) { e.mode = &m })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1393,7 +1551,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting fan mode on %s: %s", deviceID, fanMode)
 		if err := SetDeviceFanMode(deviceID, fanMode, getToken()); err != nil {
 			log.Printf("failed to set fan mode on %s: %v", deviceID, err)
+			return
 		}
+		f := fanMode
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Fan.Val = f })
+		state.Expect(deviceID, func(e *expectedWrite) { e.fan = &f })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1415,7 +1578,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 			deviceID, val, dev.Data.Schedule.Floor.A)
 		if err := SetDeviceFloorMin(deviceID, val, dev.Data.Schedule.Floor.A, getToken()); err != nil {
 			log.Printf("failed to set floor target on %s: %v", deviceID, err)
+			return
 		}
+		w, a := val, dev.Data.Schedule.Floor.A
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Schedule.Floor.W = w })
+		state.Expect(deviceID, func(e *expectedWrite) { e.floorW, e.floorA = &w, &a })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1438,7 +1606,12 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		log.Printf("setting humidity target on %s: %.0f", deviceID, val)
 		if err := SetDeviceHumidity(deviceID, val, getToken()); err != nil {
 			log.Printf("failed to set humidity target on %s: %v", deviceID, err)
+			return
 		}
+		iv := int(val)
+		state.Mutate(deviceID, func(d *MyDevice) { d.Data.Hum.Val = iv })
+		state.Expect(deviceID, func(e *expectedWrite) { e.humVal = &iv })
+		publishDeviceFromCache(client, state, deviceID)
 		pubSync <- deviceID
 	})
 
@@ -1622,7 +1795,8 @@ func main() {
 	var tokensMu sync.Mutex
 
 	deviceStates := &deviceState{
-		devices: map[string]MyDevice{},
+		devices:  map[string]MyDevice{},
+		expected: map[string]expectedWrite{},
 	}
 	deviceStates.Update(devices.Body)
 
@@ -1671,17 +1845,19 @@ func main() {
 		// If a device just received a write, ask the server to pull a fresh
 		// status from the thermostat before we re-fetch. Integration testing
 		// showed /Device/{id}/Refresh updates data.DateTime within ~3 s,
-		// compared to up to 40 s waiting for the next natural poll.
+		// but the actual setpoint values often take longer to propagate
+		// (5+ s in practice). A short delay causes the post-write poll to
+		// return stale values, which then overwrite HA's optimistic UI
+		// update — the user sees "snap-back" 1 s after a setpoint change.
+		// 5 s is empirically enough for most writes to land.
 		if refreshDeviceID != "" {
 			if _, err := API[any]("GET",
 				fmt.Sprintf("/Device/%v/Refresh", url.PathEscape(refreshDeviceID)),
 				nil, http.StatusOK, false, tokens.AccessToken); err != nil {
 				log.Printf("post-write /Refresh on %s: %v", refreshDeviceID, err)
 			}
-			// Small delay so the thermostat's push has a chance to land
-			// before we re-fetch.
 			tokensMu.Unlock()
-			time.Sleep(1 * time.Second)
+			time.Sleep(5 * time.Second)
 			tokensMu.Lock()
 		}
 
@@ -1692,14 +1868,25 @@ func main() {
 			return
 		}
 
-		deviceStates.Update(devices.Body)
+		// Overlay any pending user writes onto the polled data. The
+		// cloud's read API lags writes by a variable amount (we've seen
+		// 5–60 s); without this merge the post-write poll would publish
+		// pre-write values to MQTT and HA's optimistic UI would snap
+		// back. deviceStates.MergeExpected clears each field's pending
+		// entry the moment the poll confirms it — so as soon as the
+		// cloud catches up, we stop overriding.
+		merged := make([]MyDevice, 0, len(devices.Body))
+		for _, d := range devices.Body {
+			merged = append(merged, deviceStates.MergeExpected(d))
+		}
+		deviceStates.Update(merged)
 
 		// Location-scoped state — every connected device has the same
 		// location.awayState. Pick any connected one; if none is connected,
 		// preserve the last known state (MQTT retained) and mark offline.
 		locationOnline := false
 		locationAway := defaultLocation.AwayState
-		for _, d := range devices.Body {
+		for _, d := range merged {
 			if d.IsConnected {
 				locationOnline = true
 				locationAway = d.Location.AwayState
@@ -1708,7 +1895,7 @@ func main() {
 		}
 		publishLocationState(mqttClient, defaultLocation, locationAway, locationOnline)
 
-		for _, device := range devices.Body {
+		for _, device := range merged {
 			// Publish discovery for any device we couldn't announce at
 			// startup (it was offline) now that it has valid data.
 			if !publishedDiscovery[device.DeviceID] && device.IsConnected && device.Data.TempUnits.Val != "" {
